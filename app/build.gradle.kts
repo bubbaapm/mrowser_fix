@@ -17,7 +17,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "net.mrowser"
+        applicationId = "net.mrowser.experimental"
         minSdk = 23
         targetSdk = 34
         versionCode = 10
