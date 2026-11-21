@@ -80,7 +80,19 @@ object UpdateDialog {
             // primary action became unreachable except by pressing RIGHT. Start on Download;
             // UP still reaches the notes for anyone who wants to read them.
             download.requestFocus()
+            var completedDownloadId: Long? = null
+            var downloadStarted = false
             download.setOnClickListener {
+                val completeId = completedDownloadId
+                if (completeId != null) {
+                    ApkInstaller.install(activity, completeId) { messageRes ->
+                        body.text = activity.getString(messageRes)
+                    }
+                    return@setOnClickListener
+                }
+                if (downloadStarted) return@setOnClickListener
+                downloadStarted = true
+                download.isEnabled = false
                 ensureStoragePermission { granted ->
                     if (dismissed) return@ensureStoragePermission
                     val id = if (granted) ApkDownloader.enqueue(activity, release) else null
@@ -121,12 +133,16 @@ object UpdateDialog {
                                     // Android still requires explicit confirmation.
                                     body.text = activity.getString(R.string.update_saved,
                                         ApkDownloader.fileName(release))
+                                    completedDownloadId = id
+                                    download.text = activity.getString(R.string.update_install)
+                                    download.isEnabled = true
                                     ApkInstaller.install(activity, id) { messageRes ->
                                         body.text = activity.getString(messageRes)
                                     }
                                 }
                                 Progress.Failed -> {
                                     body.text = activity.getString(R.string.update_failed)
+                                    downloadStarted = false
                                     download.isEnabled = true
                                 }
                             }
