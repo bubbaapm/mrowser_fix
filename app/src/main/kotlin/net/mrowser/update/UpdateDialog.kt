@@ -8,6 +8,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import net.mrowser.R
+import net.mrowser.download.ApkInstaller
 
 /**
  * "Update available": version, release notes, size, and a Download that puts the APK in public
@@ -114,9 +115,16 @@ object UpdateDialog {
                                     }
                                     handler.postDelayed(this, POLL_MS)
                                 }
-                                Progress.Done -> body.text = activity.getString(
-                                    R.string.update_saved, ApkDownloader.fileName(release)
-                                )
+                                Progress.Done -> {
+                                    // The user requested this update by pressing Download.
+                                    // Transfer the downloaded APK straight to Android's installer;
+                                    // Android still requires explicit confirmation.
+                                    body.text = activity.getString(R.string.update_saved,
+                                        ApkDownloader.fileName(release))
+                                    ApkInstaller.install(activity, id) { messageRes ->
+                                        body.text = activity.getString(messageRes)
+                                    }
+                                }
                                 Progress.Failed -> {
                                     body.text = activity.getString(R.string.update_failed)
                                     download.isEnabled = true
