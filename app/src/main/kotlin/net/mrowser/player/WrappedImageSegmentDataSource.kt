@@ -10,15 +10,16 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.TransferListener
-import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
 
 /**
- * Handles the KWP1-in-PNG MPEG-TS segments observed at /obj/tiktok-obj/.
- * PNG RGB channels store "KWP1", a big-endian TS length and TS bytes.
+ * Decodes KWP1 MPEG-TS data from RGB PNG pixels on the target CDN.
  *
- * Normal streams, other hosts, and other file signatures are passed through.
- * Only the selected PNG segments are buffered and decoded in memory.
+ * Unlike the original implementation, this does not allocate a compressed PNG
+ * byte array, a full-frame IntArray, or a full-frame RGB ByteArray. Android's PNG
+ * decoder reads a bounded stream; the only large outputs are its Bitmap and the
+ * final MPEG-TS ByteArray that ExoPlayer needs.
  */
 @OptIn(UnstableApi::class)
 class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSource {
@@ -27,8 +28,8 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
     private var prefix = ByteArray(0)
     private var prefixPosition = 0
 
-    override fun addTransferListener(transferListener: TransferListener) {
-        upstream.addTransferListener(transferListener)
+    override fun addTransferListener(listener: TransferListener) {
+        upstream.addTransferListener(listener)
     }
 
     override fun open(dataSpec: DataSpec): Long {
@@ -36,56 +37,37 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
         mediaPosition = 0
         prefix = ByteArray(0)
         prefixPosition = 0
-
-        val sourceLength = upstream.open(dataSpec)
+        val originalLength = upstream.open(dataSpec)
         if (!isTarget(dataSpec.uri) || dataSpec.position != 0L ||
             dataSpec.length != C.LENGTH_UNSET.toLong()
-        ) return sourceLength
+        ) return originalLength
 
         try {
-            val signature = readUpTo(PNG_SIGNATURE.size)
+            val signature = readPrefix(8)
             if (!signature.contentEquals(PNG_SIGNATURE)) {
-                // Not an image: put the already-read bytes back for the HLS parser.
                 prefix = signature
-                return sourceLength
+                return originalLength
             }
 
-            val pngBytes = readImage(signature)
-            val bitmap = BitmapFactory.decodeByteArray(
-                pngBytes, 0, pngBytes.size,
-                BitmapFactory.Options().apply {
+            // The image data is still compressed at this point. The image codec
+            // reads directly from DataSource and enforces a 16 MiB input bound.
+            val input = CappedSourceInputStream(upstream, signature, MAX_IMAGE_BYTES)
+            val bitmap = BitmapFactory.decodeStream(
+                input, null, BitmapFactory.Options().apply {
                     inPreferredConfig = Bitmap.Config.ARGB_8888
                     inScaled = false
+                    inDither = false
                 }
-            ) ?: throw IOException("CDN PNG could not be decoded")
+            ) ?: throw IOException("CDN PNG bitmap decoder returned null")
 
-            val rgb = try {
-                val count = bitmap.width.toLong() * bitmap.height.toLong()
-                if (count <= 0 || count > MAX_PIXELS) {
-                    throw IOException("Unexpected PNG dimensions")
-                }
-                val pixels = IntArray(count.toInt())
-                bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
-                ByteArray(pixels.size * 3).also { output ->
-                    var index = 0
-                    for (pixel in pixels) {
-                        output[index++] = (pixel ushr 16).toByte()
-                        output[index++] = (pixel ushr 8).toByte()
-                        output[index++] = pixel.toByte()
-                    }
-                }
+            val ts = try {
+                unpackBitmap(bitmap)
             } finally {
                 bitmap.recycle()
             }
-
-            val ts = try {
-                Kwp1TransportStream.unpack(rgb)
-            } catch (e: IllegalArgumentException) {
-                throw IOException("PNG does not contain a valid KWP1 MPEG-TS payload", e)
-            }
             mediaBytes = ts
-            Log.i(TAG, "Decoded KWP1 PNG: image=" + pngBytes.size +
-                " bytes, MPEG-TS=" + ts.size + " bytes, packets=" + ts.size / 188)
+            Log.i(TAG, "Decoded KWP1 PNG: MPEG-TS=" + ts.size +
+                " bytes, packets=" + (ts.size / 188))
             return ts.size.toLong()
         } catch (e: Exception) {
             Log.e(TAG, "KWP1 segment decoding failed", e)
@@ -94,12 +76,67 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
         }
     }
 
+    private fun unpackBitmap(bitmap: Bitmap): ByteArray {
+        val pixelCount = bitmap.width.toLong() * bitmap.height.toLong()
+        if (pixelCount <= 0 || pixelCount > MAX_PIXELS) {
+            throw IOException("Unexpected PNG pixel dimensions")
+        }
+
+        // Extract only one scanline at a time. Row buffering is a few KiB,
+        // even when the image encodes several MiB of HEVC TS data.
+        val scanline = IntArray(bitmap.width)
+        val header = ByteArray(8)
+        var headerIndex = 0
+        var remaining = -1
+        var payload: ByteArray? = null
+        var payloadPosition = 0
+
+        for (y in 0 until bitmap.height) {
+            bitmap.getPixels(scanline, 0, bitmap.width, 0, y, bitmap.width, 1)
+            for (pixel in scanline) {
+                for (shift in intArrayOf(16, 8, 0)) {
+                    val value = (pixel ushr shift).toByte()
+                    if (headerIndex < 8) {
+                        header[headerIndex++] = value
+                        if (headerIndex == 8) {
+                            remaining = try {
+                                Kwp1TransportStream.payloadLength(
+                                    header, pixelCount * 3L
+                                )
+                            } catch (e: IllegalArgumentException) {
+                                throw IOException("Invalid KWP1 PNG header", e)
+                            }
+                            payload = ByteArray(remaining)
+                        }
+                    } else if (payloadPosition < remaining) {
+                        payload!![payloadPosition++] = value
+                    } else {
+                        break
+                    }
+                }
+                if (remaining >= 0 && payloadPosition == remaining) break
+            }
+            if (remaining >= 0 && payloadPosition == remaining) break
+        }
+
+        val ts = payload
+        if (ts == null || payloadPosition != remaining) {
+            throw IOException("Truncated KWP1 MPEG-TS payload")
+        }
+        try {
+            Kwp1TransportStream.validatePackets(ts)
+        } catch (e: IllegalArgumentException) {
+            throw IOException("KWP1 MPEG-TS packet validation failed", e)
+        }
+        return ts
+    }
+
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         if (length == 0) return 0
-        mediaBytes?.let { bytes ->
-            if (mediaPosition >= bytes.size) return C.RESULT_END_OF_INPUT
-            val count = minOf(length, bytes.size - mediaPosition)
-            bytes.copyInto(buffer, offset, mediaPosition, mediaPosition + count)
+        mediaBytes?.let { data ->
+            if (mediaPosition >= data.size) return C.RESULT_END_OF_INPUT
+            val count = minOf(length, data.size - mediaPosition)
+            data.copyInto(buffer, offset, mediaPosition, mediaPosition + count)
             mediaPosition += count
             return count
         }
@@ -123,7 +160,7 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
         upstream.close()
     }
 
-    private fun readUpTo(length: Int): ByteArray {
+    private fun readPrefix(length: Int): ByteArray {
         val bytes = ByteArray(length)
         var count = 0
         while (count < length) {
@@ -135,20 +172,40 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
         return bytes.copyOf(count)
     }
 
-    private fun readImage(signature: ByteArray): ByteArray {
-        val output = ByteArrayOutputStream(256 * 1024)
-        output.write(signature)
-        val block = ByteArray(64 * 1024)
-        while (true) {
-            val n = upstream.read(block, 0, block.size)
-            if (n == C.RESULT_END_OF_INPUT) break
-            if (n <= 0) throw IOException("Zero-byte read from CDN image")
-            if (output.size().toLong() + n > MAX_IMAGE_BYTES) {
-                throw IOException("CDN PNG exceeds image-size safety limit")
-            }
-            output.write(block, 0, n)
+    /** Non-owning stream: closing this adapter must not close the DataSource twice. */
+    private class CappedSourceInputStream(
+        private val upstream: DataSource,
+        private val initial: ByteArray,
+        private val limit: Long
+    ) : InputStream() {
+        private var position = 0
+        private var received = initial.size.toLong()
+
+        override fun read(): Int {
+            val single = ByteArray(1)
+            return if (read(single, 0, 1) < 0) -1 else single[0].toInt() and 255
         }
-        return output.toByteArray()
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (off < 0 || len < 0 || off > b.size - len) {
+                throw IndexOutOfBoundsException()
+            }
+            if (len == 0) return 0
+            if (position < initial.size) {
+                val n = minOf(len, initial.size - position)
+                initial.copyInto(b, off, position, position + n)
+                position += n
+                return n
+            }
+            if (received >= limit) {
+                throw IOException("PNG compressed input exceeds size limit")
+            }
+            val n = upstream.read(b, off, minOf(len.toLong(), limit - received).toInt())
+            if (n == C.RESULT_END_OF_INPUT) return -1
+            if (n <= 0) throw IOException("Zero-byte read from PNG source")
+            received += n
+            return n
+        }
     }
 
     private fun isTarget(uri: Uri): Boolean {
