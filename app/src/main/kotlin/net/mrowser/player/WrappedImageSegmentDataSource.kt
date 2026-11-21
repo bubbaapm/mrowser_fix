@@ -1,84 +1,94 @@
 package net.mrowser.player
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
+import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.TransferListener
-import java.io.EOFException
+import java.io.ByteArrayOutputStream
 import java.io.IOException
-import java.io.File
-import java.io.FileOutputStream
-import java.util.concurrent.atomic.AtomicBoolean
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 /**
- * Experimental HLS DataSource for CDN objects containing an image prefix followed
- * by MPEG-TS bytes. Non-target URLs and non-image responses pass through unchanged.
+ * Handles the KWP1-in-PNG MPEG-TS segments observed at /obj/tiktok-obj/.
+ * PNG RGB channels store "KWP1", a big-endian TS length and TS bytes.
  *
- * This does not decode bytes encoded into image pixels or circumvent encryption.
- * It is intentionally restricted to TikTok CDN object paths for a reversible test.
+ * Normal streams, other hosts, and other file signatures are passed through.
+ * Only the selected PNG segments are buffered and decoded in memory.
  */
-@androidx.annotation.OptIn(markerClass = [UnstableApi::class])
-class WrappedImageSegmentDataSource(
-    private val upstream: DataSource,
-    private val captureDirectory: File
-) : DataSource {
-    private var pending = ByteArray(0)
-    private var pendingOffset = 0
-    private var capture: FileOutputStream? = null
-    private var capturedBytes = 0L
+@OptIn(UnstableApi::class)
+class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSource {
+    private var mediaBytes: ByteArray? = null
+    private var mediaPosition = 0
+    private var prefix = ByteArray(0)
+    private var prefixPosition = 0
 
     override fun addTransferListener(transferListener: TransferListener) {
         upstream.addTransferListener(transferListener)
     }
 
     override fun open(dataSpec: DataSpec): Long {
-        pending = ByteArray(0)
-        pendingOffset = 0
-        val upstreamLength = upstream.open(dataSpec)
+        mediaBytes = null
+        mediaPosition = 0
+        prefix = ByteArray(0)
+        prefixPosition = 0
+
+        val sourceLength = upstream.open(dataSpec)
+        if (!isTarget(dataSpec.uri) || dataSpec.position != 0L ||
+            dataSpec.length != C.LENGTH_UNSET.toLong()
+        ) return sourceLength
+
         try {
-            if (isTarget(dataSpec.uri) && dataSpec.position == 0L &&
-                captureReserved.compareAndSet(false, true)
-            ) {
-                val file = File(captureDirectory, "tiktok_segment_raw.bin")
-                capture = FileOutputStream(file, false)
-                capturedBytes = 0L
-                Log.i(TAG, "Capturing first raw CDN segment to app-private files/tiktok_segment_raw.bin")
-            }
-            // Don't interfere with byte-range media loads or arbitrary stream hosts.
-            if (!isTarget(dataSpec.uri) || dataSpec.position != 0L ||
-                dataSpec.length != C.LENGTH_UNSET.toLong()
-            ) return upstreamLength
-
-            val signature = readUpTo(8)
-            if (signature.isEmpty()) return upstreamLength
-
-            if (signature.contentEquals(PNG_SIGNATURE)) {
-                val prefixLength = skipPng(signature.size.toLong())
-                peekPayload("PNG", prefixLength)
-                return adjustedLength(upstreamLength, prefixLength)
+            val signature = readUpTo(PNG_SIGNATURE.size)
+            if (!signature.contentEquals(PNG_SIGNATURE)) {
+                // Not an image: put the already-read bytes back for the HLS parser.
+                prefix = signature
+                return sourceLength
             }
 
-            if (signature.size >= 2 &&
-                (signature[0].toInt() and 255) == 0xFF &&
-                (signature[1].toInt() and 255) == 0xD8
-            ) {
-                val prefixLength = skipJpeg(signature)
-                peekPayload("JPEG", prefixLength)
-                return adjustedLength(upstreamLength, prefixLength)
+            val pngBytes = readImage(signature)
+            val bitmap = BitmapFactory.decodeByteArray(
+                pngBytes, 0, pngBytes.size,
+                BitmapFactory.Options().apply {
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                    inScaled = false
+                }
+            ) ?: throw IOException("CDN PNG could not be decoded")
+
+            val rgb = try {
+                val count = bitmap.width.toLong() * bitmap.height.toLong()
+                if (count <= 0 || count > MAX_PIXELS) {
+                    throw IOException("Unexpected PNG dimensions")
+                }
+                val pixels = IntArray(count.toInt())
+                bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+                ByteArray(pixels.size * 3).also { output ->
+                    var index = 0
+                    for (pixel in pixels) {
+                        output[index++] = (pixel ushr 16).toByte()
+                        output[index++] = (pixel ushr 8).toByte()
+                        output[index++] = pixel.toByte()
+                    }
+                }
+            } finally {
+                bitmap.recycle()
             }
 
-            // If the CDN object isn't an image, do not consume or change its data.
-            pending = signature
-            Log.i(TAG, "CDN segment has no image wrapper; first bytes " + toHex(signature))
-            return upstreamLength
+            val ts = try {
+                Kwp1TransportStream.unpack(rgb)
+            } catch (e: IllegalArgumentException) {
+                throw IOException("PNG does not contain a valid KWP1 MPEG-TS payload", e)
+            }
+            mediaBytes = ts
+            Log.i(TAG, "Decoded KWP1 PNG: image=" + pngBytes.size +
+                " bytes, MPEG-TS=" + ts.size + " bytes, packets=" + ts.size / 188)
+            return ts.size.toLong()
         } catch (e: Exception) {
-            Log.e(TAG, "Segment unwrap failed", e)
-            finishCapture()
+            Log.e(TAG, "KWP1 segment decoding failed", e)
             upstream.close()
             throw e
         }
@@ -86,146 +96,59 @@ class WrappedImageSegmentDataSource(
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         if (length == 0) return 0
-        if (pendingOffset < pending.size) {
-            val count = minOf(length, pending.size - pendingOffset)
-            pending.copyInto(buffer, offset, pendingOffset, pendingOffset + count)
-            pendingOffset += count
+        mediaBytes?.let { bytes ->
+            if (mediaPosition >= bytes.size) return C.RESULT_END_OF_INPUT
+            val count = minOf(length, bytes.size - mediaPosition)
+            bytes.copyInto(buffer, offset, mediaPosition, mediaPosition + count)
+            mediaPosition += count
             return count
         }
-        return readTracked(buffer, offset, length)
+        if (prefixPosition < prefix.size) {
+            val count = minOf(length, prefix.size - prefixPosition)
+            prefix.copyInto(buffer, offset, prefixPosition, prefixPosition + count)
+            prefixPosition += count
+            return count
+        }
+        return upstream.read(buffer, offset, length)
     }
 
     override fun getUri(): Uri? = upstream.getUri()
     override fun getResponseHeaders(): Map<String, List<String>> = upstream.getResponseHeaders()
 
     override fun close() {
-        pending = ByteArray(0)
-        pendingOffset = 0
-        finishCapture()
+        mediaBytes = null
+        mediaPosition = 0
+        prefix = ByteArray(0)
+        prefixPosition = 0
         upstream.close()
     }
 
-    private var chunkLogCount = 0
+    private fun readUpTo(length: Int): ByteArray {
+        val bytes = ByteArray(length)
+        var count = 0
+        while (count < length) {
+            val n = upstream.read(bytes, count, length - count)
+            if (n == C.RESULT_END_OF_INPUT) break
+            if (n <= 0) throw IOException("Zero-byte read from CDN")
+            count += n
+        }
+        return bytes.copyOf(count)
+    }
 
-    private fun skipPng(startBytes: Long): Long {
-        var consumed = startBytes
-        while (consumed < MAX_IMAGE_BYTES) {
-            val header = readExactly(8)
-            consumed += 8
-            val chunkLength = ByteBuffer.wrap(header, 0, 4)
-                .order(ByteOrder.BIG_ENDIAN).int.toLong() and 0xffffffffL
-            val type = String(header, 4, 4, Charsets.US_ASCII)
-            if (chunkLogCount++ < 16) Log.i(TAG, "PNG chunk type=$type bytes=$chunkLength")
-            if (chunkLength > MAX_IMAGE_BYTES - consumed - 4) {
-                throw IOException("PNG chunk exceeds image-prefix limit")
+    private fun readImage(signature: ByteArray): ByteArray {
+        val output = ByteArrayOutputStream(256 * 1024)
+        output.write(signature)
+        val block = ByteArray(64 * 1024)
+        while (true) {
+            val n = upstream.read(block, 0, block.size)
+            if (n == C.RESULT_END_OF_INPUT) break
+            if (n <= 0) throw IOException("Zero-byte read from CDN image")
+            if (output.size().toLong() + n > MAX_IMAGE_BYTES) {
+                throw IOException("CDN PNG exceeds image-size safety limit")
             }
-            skipExactly(chunkLength + 4) // chunk content + CRC32
-            consumed += chunkLength + 4
-            if (type == "IEND") {
-                if (chunkLength != 0L) throw IOException("Invalid PNG IEND length")
-                return consumed
-            }
+            output.write(block, 0, n)
         }
-        throw IOException("PNG IEND not found within image-prefix limit")
-    }
-
-    private fun skipJpeg(signature: ByteArray): Long {
-        // In JPEG entropy data, literal 0xFF bytes are stuffed as FF 00,
-        // so FF D9 identifies the end-of-image marker.
-        var previous = signature.last().toInt() and 255
-        var consumed = signature.size.toLong()
-        val buffer = ByteArray(16 * 1024)
-        while (consumed < MAX_IMAGE_BYTES) {
-            val n = readTracked(
-                buffer, 0, minOf(buffer.size.toLong(), MAX_IMAGE_BYTES - consumed).toInt()
-            )
-            if (n <= 0) throw EOFException("JPEG EOI marker not found")
-            consumed += n
-            for (i in 0 until n) {
-                val current = buffer[i].toInt() and 255
-                if (previous == 0xFF && current == 0xD9) {
-                    // The read may have passed the JPEG end. Preserve those video bytes.
-                    pending = buffer.copyOfRange(i + 1, n)
-                    return consumed - pending.size
-                }
-                previous = current
-            }
-        }
-        throw IOException("JPEG EOI not found within image-prefix limit")
-    }
-
-    private fun peekPayload(type: String, prefixBytes: Long) {
-        if (pending.isEmpty()) pending = readUpTo(8)
-        if (pending.isEmpty()) throw EOFException("Image has no appended video payload")
-        val tsByte = (pending[0].toInt() and 255) == 0x47
-        Log.i(TAG, type + " wrapper skipped " + prefixBytes +
-            " bytes; payload first bytes " + toHex(pending) + "; TS byte=" + tsByte)
-    }
-
-    private fun toHex(bytes: ByteArray): String =
-        bytes.take(8).joinToString(" ") { "%02X".format(it.toInt() and 255) }
-
-    private fun readUpTo(count: Int): ByteArray {
-        val bytes = ByteArray(count)
-        var pos = 0
-        while (pos < count) {
-            val n = readTracked(bytes, pos, count - pos)
-            if (n < 0) break
-            if (n == 0) throw IOException("Unexpected zero-byte DataSource read")
-            pos += n
-        }
-        return bytes.copyOf(pos)
-    }
-
-    private fun readExactly(count: Int): ByteArray {
-        val bytes = readUpTo(count)
-        if (bytes.size != count) throw EOFException("Truncated image header")
-        return bytes
-    }
-
-    private fun skipExactly(size: Long) {
-        val buffer = ByteArray(16 * 1024)
-        var left = size
-        while (left > 0) {
-            val n = readTracked(buffer, 0, minOf(left, buffer.size.toLong()).toInt())
-            if (n <= 0) throw EOFException("Image ended before end-of-image marker")
-            left -= n
-        }
-    }
-
-    /** Capture the exact bytes returned by the CDN, not a re-encoded screenshot. */
-    private fun readTracked(buffer: ByteArray, offset: Int, length: Int): Int {
-        val n = upstream.read(buffer, offset, length)
-        if (n < 0) {
-            finishCapture()
-        } else if (n > 0) {
-            capture?.let { out ->
-                val toWrite = minOf(n.toLong(), CAPTURE_LIMIT - capturedBytes).toInt()
-                if (toWrite > 0) {
-                    out.write(buffer, offset, toWrite)
-                    capturedBytes += toWrite
-                }
-                if (capturedBytes >= CAPTURE_LIMIT) finishCapture()
-            }
-        }
-        return n
-    }
-
-    private fun finishCapture() {
-        val out = capture ?: return
-        capture = null
-        try {
-            out.close()
-            Log.i(TAG, "Raw segment capture complete: $capturedBytes bytes saved")
-        } catch (e: IOException) {
-            Log.e(TAG, "Cannot finish segment capture", e)
-        }
-    }
-
-    private fun adjustedLength(original: Long, prefix: Long): Long {
-        if (original == C.LENGTH_UNSET.toLong()) return original
-        if (original < prefix) throw IOException("Image prefix larger than response")
-        return original - prefix
+        return output.toByteArray()
     }
 
     private fun isTarget(uri: Uri): Boolean {
@@ -236,9 +159,8 @@ class WrappedImageSegmentDataSource(
 
     companion object {
         private const val TAG = "WrappedImageSegment"
-        private const val MAX_IMAGE_BYTES = 32L * 1024 * 1024
-        private const val CAPTURE_LIMIT = 8L * 1024 * 1024
-        private val captureReserved = AtomicBoolean(false)
+        private const val MAX_IMAGE_BYTES = 16L * 1024 * 1024
+        private const val MAX_PIXELS = 4L * 1024 * 1024
         private val PNG_SIGNATURE = byteArrayOf(
             0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A
         )
