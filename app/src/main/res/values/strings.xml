@@ -85,6 +85,7 @@
     <string name="update_title">Update to %1$s</string>
     <string name="update_body">%1$s\n\n%2$s</string>
     <string name="update_download">Download</string>
+    <string name="update_install">Install update</string>
     <string name="update_obtainium">Automatic updates</string>
     <string name="close">Close</string>
     <string name="update_downloading">Downloading… %1$s / %2$s</string>
