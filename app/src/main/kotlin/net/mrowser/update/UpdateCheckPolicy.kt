@@ -4,11 +4,10 @@ package net.mrowser.update
 object UpdateCheckPolicy {
 
     /**
-     * One check a day. GitHub allows 60 unauthenticated requests an hour per IP, and
-     * carrier-grade NAT puts many users behind one address, so this stays deliberately far
-     * under.
+     * Experimental personal fork: check at most once every five minutes on launch.
+     * Stable upstream builds use a longer interval; this branch is for testing releases.
      */
-    const val CHECK_INTERVAL_MS = 24L * 60L * 60L * 1000L
+    const val CHECK_INTERVAL_MS = 5L * 60L * 1000L
 
     /**
      * A timestamp in the future means the clock moved backwards (a TV that lost its time and
