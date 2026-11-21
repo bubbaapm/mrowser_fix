@@ -94,7 +94,7 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
         for (y in 0 until bitmap.height) {
             bitmap.getPixels(scanline, 0, bitmap.width, 0, y, bitmap.width, 1)
             for (pixel in scanline) {
-                for (shift in intArrayOf(16, 8, 0)) {
+                for (shift in 16 downTo 0 step 8) {
                     val value = (pixel ushr shift).toByte()
                     if (headerIndex < 8) {
                         header[headerIndex++] = value
