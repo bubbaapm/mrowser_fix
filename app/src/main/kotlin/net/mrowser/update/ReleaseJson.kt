@@ -30,21 +30,30 @@ object ReleaseJson {
         val tag = o.optString("tag_name").takeIf { it.isNotBlank() } ?: return null
         val htmlUrl = o.optString("html_url").takeIf { it.isNotBlank() } ?: return null
 
-        var apkUrl: String? = null
-        var apkSize = 0L
-        var apkCount = 0
+        // On the experimental fork, the upstream release workflow may also attach
+        // app-release.apk from main. Always prefer the explicitly named experimental
+        // package, and only fall back when the release has exactly one APK.
+        val candidates = ArrayList<Pair<String, Long>>()
+        val names = ArrayList<String>()
         val assets = o.optJSONArray("assets")
         if (assets != null) {
             for (i in 0 until assets.length()) {
                 val a = assets.optJSONObject(i) ?: continue
-                if (!a.optString("name").endsWith(".apk", ignoreCase = true)) continue
-                apkCount++
-                apkUrl = a.optString("browser_download_url").takeIf { it.isNotBlank() }
-                apkSize = a.optLong("size", 0L)
+                val name = a.optString("name")
+                if (!name.endsWith(".apk", ignoreCase = true)) continue
+                val url = a.optString("browser_download_url").takeIf { it.isNotBlank() } ?: continue
+                names += name
+                candidates += url to a.optLong("size", 0L)
             }
         }
-        if (apkCount != 1) return null
-        val url = apkUrl ?: return null
+        val experimentalIndex = names.indexOf("mrowser-experimental.apk")
+        val selected = when {
+            experimentalIndex >= 0 -> candidates[experimentalIndex]
+            candidates.size == 1 -> candidates[0]
+            else -> return null
+        }
+        val url = selected.first
+        val apkSize = selected.second
 
         return Release(
             tag = tag,
