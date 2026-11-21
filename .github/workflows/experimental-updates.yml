@@ -68,7 +68,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BUILD_NUMBER: ${{ github.run_number }}
         run: |
-          gh release create "v1.5.${BUILD_NUMBER}" app/build/outputs/apk/release/app-release.apk \
+          cp app/build/outputs/apk/release/app-release.apk mrowser-experimental.apk
+          gh release create "v1.5.${BUILD_NUMBER}" mrowser-experimental.apk \
             --title "Experimental mrowser 1.5.${BUILD_NUMBER}" \
             --notes "Experimental KWP1 HLS support with reduced PNG allocations. Android will request install confirmation." \
             --target "$GITHUB_SHA" \
