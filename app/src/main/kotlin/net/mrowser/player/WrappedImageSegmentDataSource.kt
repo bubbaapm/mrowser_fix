@@ -82,18 +82,21 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
             throw IOException("Unexpected PNG pixel dimensions")
         }
 
-        // Extract only one scanline at a time. Row buffering is a few KiB,
-        // even when the image encodes several MiB of HEVC TS data.
-        val scanline = IntArray(bitmap.width)
+        // Extract a small stripe at a time. This keeps pixel buffering under
+        // ~0.1 MiB and avoids hundreds of small Bitmap.getPixels() calls.
+        val stripeRows = 32
+        val stripe = IntArray(bitmap.width * stripeRows)
         val header = ByteArray(8)
         var headerIndex = 0
         var remaining = -1
         var payload: ByteArray? = null
         var payloadPosition = 0
 
-        for (y in 0 until bitmap.height) {
-            bitmap.getPixels(scanline, 0, bitmap.width, 0, y, bitmap.width, 1)
-            for (pixel in scanline) {
+        for (y in 0 until bitmap.height step stripeRows) {
+            val rows = minOf(stripeRows, bitmap.height - y)
+            bitmap.getPixels(stripe, 0, bitmap.width, 0, y, bitmap.width, rows)
+            for (index in 0 until bitmap.width * rows) {
+                val pixel = stripe[index]
                 for (shift in 16 downTo 0 step 8) {
                     val value = (pixel ushr shift).toByte()
                     if (headerIndex < 8) {
