@@ -52,6 +52,16 @@
                 <data android:scheme="https" />
             </intent-filter>
         </activity>
+        <!-- Delivered only to this app after a successful in-place update (API 12+).
+             The cleanup receiver never installs an APK, and can delete only our own
+             completed experimental release download after the upgrade. -->
+        <receiver
+            android:name=".update.UpdateReplacedReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
         <activity
             android:name=".player.PlayerActivity"
             android:exported="false"

@@ -325,6 +325,9 @@ class MainActivity : Activity() {
         seedDefaultFavorites()
 
         updateIo = Executors.newSingleThreadExecutor()
+        // Remove only the APK matching this already-installed version. Running this off the
+        // UI thread also covers devices where the package-replaced broadcast was dropped.
+        updateIo.execute { net.mrowser.update.UpdateApkCleanup.afterSuccessfulInstall(applicationContext) }
         updates = UpdateController(
             store = JsonUpdateStore(File(filesDir, "update.json")),
             installedVersion = installedVersion(),
