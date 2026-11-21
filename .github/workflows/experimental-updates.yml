@@ -15,16 +15,13 @@ jobs:
       - name: Check signing secrets
         id: signing
         env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          MROWSER_SIGNING_BUNDLE: ${{ secrets.MROWSER_SIGNING_BUNDLE }}
         run: |
-          if [[ -n "$KEYSTORE_BASE64" && -n "$STORE_PASSWORD" && -n "$KEY_ALIAS" && -n "$KEY_PASSWORD" ]]; then
+          if [[ -n "$MROWSER_SIGNING_BUNDLE" && "$MROWSER_SIGNING_BUNDLE" == *:* ]]; then
             echo 'ready=true' >> "$GITHUB_OUTPUT"
           else
             echo 'ready=false' >> "$GITHUB_OUTPUT"
-            echo 'Release skipped: configure four signing secrets first.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Release skipped: configure the MROWSER_SIGNING_BUNDLE secret first.' >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         if: steps.signing.outputs.ready == 'true'
@@ -43,17 +40,16 @@ jobs:
       - name: Restore signing keystore
         if: steps.signing.outputs.ready == 'true'
         env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          MROWSER_SIGNING_BUNDLE: ${{ secrets.MROWSER_SIGNING_BUNDLE }}
         run: |
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > release.keystore
+          signing_password="${MROWSER_SIGNING_BUNDLE%%:*}"
+          signing_key_base64="${MROWSER_SIGNING_BUNDLE#*:}"
+          printf '%s' "$signing_key_base64" | base64 --decode > release.keystore
           {
             echo 'storeFile=release.keystore'
-            echo "storePassword=$STORE_PASSWORD"
-            echo "keyAlias=$KEY_ALIAS"
-            echo "keyPassword=$KEY_PASSWORD"
+            echo "storePassword=$signing_password"
+            echo 'keyAlias=mrowser_experimental'
+            echo "keyPassword=$signing_password"
           } > keystore.properties
       - name: Build, test, and sign APK
         if: steps.signing.outputs.ready == 'true'
