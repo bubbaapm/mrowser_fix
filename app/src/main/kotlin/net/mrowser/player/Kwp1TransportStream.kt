@@ -13,32 +13,41 @@ internal object Kwp1TransportStream {
     private const val HEADER_SIZE = 8
     private const val TS_PACKET_SIZE = 188
 
-    fun unpack(rgb: ByteArray): ByteArray {
-        require(rgb.size >= HEADER_SIZE) { "KWP1 image is too short" }
-        require(rgb[0] == 0x4B.toByte() &&
-            rgb[1] == 0x57.toByte() &&
-            rgb[2] == 0x50.toByte() &&
-            rgb[3] == 0x31.toByte()
+    /** Validates the 8-byte raster header without allocating a full RGB raster. */
+    fun payloadLength(header: ByteArray, rgbCapacity: Long): Int {
+        require(header.size == HEADER_SIZE) { "Expected eight KWP1 header bytes" }
+        require(header[0] == 0x4B.toByte() &&
+            header[1] == 0x57.toByte() &&
+            header[2] == 0x50.toByte() &&
+            header[3] == 0x31.toByte()
         ) { "PNG pixels do not contain KWP1 signature" }
 
-        val length = ((rgb[4].toLong() and 0xFF) shl 24) or
-            ((rgb[5].toLong() and 0xFF) shl 16) or
-            ((rgb[6].toLong() and 0xFF) shl 8) or
-            (rgb[7].toLong() and 0xFF)
+        val size = ((header[4].toLong() and 0xFF) shl 24) or
+            ((header[5].toLong() and 0xFF) shl 16) or
+            ((header[6].toLong() and 0xFF) shl 8) or
+            (header[7].toLong() and 0xFF)
+        require(size > 0 && size <= rgbCapacity - HEADER_SIZE &&
+            size <= Int.MAX_VALUE && size % TS_PACKET_SIZE == 0L
+        ) { "Invalid MPEG-TS payload length $size for RGB capacity $rgbCapacity" }
+        return size.toInt()
+    }
 
-        require(length > 0 && length <= rgb.size.toLong() - HEADER_SIZE) {
-            "KWP1 payload length is invalid: " + length + " (RGB bytes: " + rgb.size + ")"
+    fun validatePackets(ts: ByteArray) {
+        require(ts.isNotEmpty() && ts.size % TS_PACKET_SIZE == 0) {
+            "KWP1 payload is not an integral number of MPEG-TS packets"
         }
-        require(length % TS_PACKET_SIZE == 0L) {
-            "KWP1 payload is not an integral number of MPEG-TS packets: " + length
-        }
-
-        val end = HEADER_SIZE + length.toInt()
-        for (position in HEADER_SIZE until end step TS_PACKET_SIZE) {
-            require((rgb[position].toInt() and 0xFF) == 0x47) {
-                "MPEG-TS sync byte missing at packet offset " + (position - HEADER_SIZE)
+        for (i in ts.indices step TS_PACKET_SIZE) {
+            require((ts[i].toInt() and 0xFF) == 0x47) {
+                "MPEG-TS synchronization byte missing at offset $i"
             }
         }
-        return rgb.copyOfRange(HEADER_SIZE, end)
+    }
+
+    fun unpack(rgb: ByteArray): ByteArray {
+        require(rgb.size >= HEADER_SIZE) { "KWP1 image is too short" }
+        val size = payloadLength(rgb.copyOfRange(0, HEADER_SIZE), rgb.size.toLong())
+        val ts = rgb.copyOfRange(HEADER_SIZE, HEADER_SIZE + size)
+        validatePackets(ts)
+        return ts
     }
 }
