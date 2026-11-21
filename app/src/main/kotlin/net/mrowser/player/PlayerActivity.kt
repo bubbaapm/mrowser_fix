@@ -99,7 +99,7 @@ class PlayerActivity : Activity() {
         val exo = ExoPlayer.Builder(this)
             .setTrackSelector(trackSelector)
             .setMediaSourceFactory(DefaultMediaSourceFactory(DataSource.Factory {
-                WrappedImageSegmentDataSource(sourceFactory.createDataSource(), filesDir)
+                WrappedImageSegmentDataSource(sourceFactory.createDataSource())
             }))
             .build()
         player = exo
