@@ -48,6 +48,15 @@ class ReleaseJsonTest {
             {"name":"app-release-arm64.apk","size":2,"browser_download_url":"https://github.com/a/b/2.apk"}]""")))
     }
 
+    @Test fun `prefers experimental APK when main build asset is also present`() {
+        val json = payload(assets = """[
+            {"name":"app-release.apk","size":1,"browser_download_url":"https://github.com/a/b/main.apk"},
+            {"name":"mrowser-experimental.apk","size":42,"browser_download_url":"https://github.com/a/b/experimental.apk"}]""")
+        val r = ReleaseJson.parse(json)!!
+        assertEquals(42L, r.apkSizeBytes)
+        assertEquals("https://github.com/a/b/experimental.apk", r.apkUrl)
+    }
+
     @Test fun `an empty asset list is not offered`() {
         assertNull(ReleaseJson.parse(payload(assets = "[]")))
     }

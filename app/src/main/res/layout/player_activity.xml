@@ -13,6 +13,24 @@
         app:show_subtitle_button="false"
         app:resize_mode="fit" />
 
+    <!-- Opt-in diagnostics: no focus, no clicks, no animation, no polling while hidden.
+         Keep above video surface but away from the subtitle region and controller. -->
+    <TextView
+        android:id="@+id/playbackStatsView"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_margin="20dp"
+        android:padding="12dp"
+        android:background="#D9000000"
+        android:textColor="@android:color/white"
+        android:textSize="13sp"
+        android:fontFamily="monospace"
+        android:focusable="false"
+        android:clickable="false"
+        android:importantForAccessibility="no"
+        android:visibility="gone" />
+
     <!-- The sub-sync capsule: 40dp tall with 5dp padding all round, so the 30dp buttons sit
          concentric. Icons are vectors, exactly centred (text glyphs sat off-centre). -->
     <LinearLayout

@@ -15,7 +15,7 @@ import java.net.URL
 object ReleaseFetcher {
 
     const val LATEST_RELEASE_URL =
-        "https://api.github.com/repos/m-salehi-v/mrowser/releases/latest"
+        "https://api.github.com/repos/bubbaapm/mrowser_fix/releases/latest"
 
     private const val TAG = "ReleaseFetcher"
     private const val TIMEOUT_MS = 15_000

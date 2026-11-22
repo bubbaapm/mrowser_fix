@@ -1,0 +1,73 @@
+name: Experimental in-app updates
+
+on:
+  push:
+    branches: [ experiment/wrapped-hls-segments ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-experimental-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check signing secrets
+        id: signing
+        env:
+          MROWSER_SIGNING_BUNDLE: ${{ secrets.MROWSER_SIGNING_BUNDLE }}
+        run: |
+          if [[ -n "$MROWSER_SIGNING_BUNDLE" && "$MROWSER_SIGNING_BUNDLE" == *:* ]]; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo 'Release skipped: configure the MROWSER_SIGNING_BUNDLE secret first.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: steps.signing.outputs.ready == 'true'
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78
+        if: steps.signing.outputs.ready == 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd
+        if: steps.signing.outputs.ready == 'true'
+        with:
+          packages: platform-tools
+      - name: Install Android SDK
+        if: steps.signing.outputs.ready == 'true'
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - name: Restore signing keystore
+        if: steps.signing.outputs.ready == 'true'
+        env:
+          MROWSER_SIGNING_BUNDLE: ${{ secrets.MROWSER_SIGNING_BUNDLE }}
+        run: |
+          signing_password="${MROWSER_SIGNING_BUNDLE%%:*}"
+          signing_key_base64="${MROWSER_SIGNING_BUNDLE#*:}"
+          printf '%s' "$signing_key_base64" | base64 --decode > release.keystore
+          {
+            echo 'storeFile=release.keystore'
+            echo "storePassword=$signing_password"
+            echo 'keyAlias=mrowser_experimental'
+            echo "keyPassword=$signing_password"
+          } > keystore.properties
+      - name: Build, test, and sign APK
+        if: steps.signing.outputs.ready == 'true'
+        env:
+          MROWSER_EXPERIMENT_BUILD: ${{ github.run_number }}
+        run: |
+          ./gradlew test
+          ./gradlew assembleRelease
+      - name: Publish update for TV
+        if: steps.signing.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk mrowser-experimental.apk
+          gh release create "v1.5.${BUILD_NUMBER}" mrowser-experimental.apk \
+            --title "Experimental mrowser 1.5.${BUILD_NUMBER}" \
+            --notes "Experimental KWP1 HLS support with reduced PNG allocations. Android will request install confirmation." \
+            --target "$GITHUB_SHA" \
+            --latest
+          echo "Published v1.5.${BUILD_NUMBER} for in-app installation" >> "$GITHUB_STEP_SUMMARY"

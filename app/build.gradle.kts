@@ -17,11 +17,12 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "net.mrowser"
+        applicationId = "net.mrowser.experimental"
         minSdk = 23
         targetSdk = 34
-        versionCode = 10
-        versionName = "1.5.0"
+        val experimentalBuild = System.getenv("MROWSER_EXPERIMENT_BUILD")?.toIntOrNull()
+        versionCode = experimentalBuild?.let { 10_000 + it } ?: 10
+        versionName = experimentalBuild?.let { "1.5." + it } ?: "1.5.0"
     }
 
     signingConfigs {

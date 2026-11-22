@@ -10,7 +10,10 @@ import net.mrowser.stream.StreamSniffer
 /** Turns a chip activation, or a Play on a downloaded video, into a launched PlayerActivity. */
 class HandoffController(
     private val context: Context,
-    private val sniffer: StreamSniffer
+    private val sniffer: StreamSniffer,
+    // Runs on the UI thread before launching the native player, giving the
+    // browser a chance to pause any embedded HTML5 playback.
+    private val beforePlayerLaunch: () -> Unit = {}
 ) {
     fun play() {
         sniffer.bestRequest()?.let(::play)
@@ -18,6 +21,7 @@ class HandoffController(
     }
 
     fun play(request: PlaybackRequest) {
+        beforePlayerLaunch()
         context.startActivity(
             Intent(context, PlayerActivity::class.java)
                 .putExtra(PlayerActivity.EXTRA_REQUEST, request.toJson())
