@@ -105,24 +105,41 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
             bitmap.getPixels(stripe, 0, bitmap.width, 0, y, bitmap.width, rows)
             for (index in 0 until bitmap.width * rows) {
                 val pixel = stripe[index]
-                for (shift in 16 downTo 0 step 8) {
-                    val value = (pixel ushr shift).toByte()
-                    if (headerIndex < 8) {
-                        header[headerIndex++] = value
-                        if (headerIndex == 8) {
-                            remaining = try {
-                                Kwp1TransportStream.payloadLength(
-                                    header, pixelCount * 3L
-                                )
-                            } catch (e: IllegalArgumentException) {
-                                throw IOException("Invalid KWP1 PNG header", e)
+                if (headerIndex < 8) {
+                    // Only the first three RGB pixels carry the KWP1 header.
+                    // The third pixel's final blue byte is already payload.
+                    for (shift in 16 downTo 0 step 8) {
+                        val value = (pixel ushr shift).toByte()
+                        if (headerIndex < 8) {
+                            header[headerIndex++] = value
+                            if (headerIndex == 8) {
+                                remaining = try {
+                                    Kwp1TransportStream.payloadLength(header, pixelCount * 3L)
+                                } catch (e: IllegalArgumentException) {
+                                    throw IOException("Invalid KWP1 PNG header", e)
+                                }
+                                payload = ByteArray(remaining)
                             }
-                            payload = ByteArray(remaining)
+                        } else if (payloadPosition < remaining) {
+                            payload!![payloadPosition++] = value
                         }
+                    }
+                } else {
+                    // Hot path: write a whole RGB pixel directly, without three
+                    // inner-loop iterations or per-channel header checks.
+                    val ts = payload ?: throw IOException("Missing KWP1 payload")
+                    if (payloadPosition + 3 <= remaining) {
+                        ts[payloadPosition++] = (pixel ushr 16).toByte()
+                        ts[payloadPosition++] = (pixel ushr 8).toByte()
+                        ts[payloadPosition++] = pixel.toByte()
                     } else if (payloadPosition < remaining) {
-                        payload!![payloadPosition++] = value
-                    } else {
-                        break
+                        ts[payloadPosition++] = (pixel ushr 16).toByte()
+                        if (payloadPosition < remaining) {
+                            ts[payloadPosition++] = (pixel ushr 8).toByte()
+                        }
+                        if (payloadPosition < remaining) {
+                            ts[payloadPosition++] = pixel.toByte()
+                        }
                     }
                 }
                 if (remaining >= 0 && payloadPosition == remaining) break
@@ -190,13 +207,15 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
         private val limit: Long
     ) : InputStream() {
         private var position = 0
+        // BitmapFactory may invoke the single-byte form when inspecting the
+        // PNG signature/chunks; do not allocate a fresh array each time.
+        private val singleByte = ByteArray(1)
         private var received = initial.size.toLong()
         private var accumulatedNetworkNs = 0L
         val networkReadMs: Long get() = accumulatedNetworkNs / 1_000_000L
 
         override fun read(): Int {
-            val single = ByteArray(1)
-            return if (read(single, 0, 1) < 0) -1 else single[0].toInt() and 255
+            return if (read(singleByte, 0, 1) < 0) -1 else singleByte[0].toInt() and 255
         }
 
         override fun read(b: ByteArray, off: Int, len: Int): Int {

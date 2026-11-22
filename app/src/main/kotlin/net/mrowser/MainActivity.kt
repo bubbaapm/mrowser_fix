@@ -362,7 +362,7 @@ class MainActivity : Activity() {
             onCleared = { playChip.visibility = View.GONE },
             schedule = { delayMs, task -> uiHandler.postDelayed(task, delayMs) }
         )
-        handoff = HandoffController(this, sniffer)
+        handoff = HandoffController(this, sniffer, beforePlayerLaunch = ::pausePageMediaForPlayer)
 
         externalLinks = ExternalIntentLauncher(
             context = this,
@@ -1331,15 +1331,37 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * Best-effort, non-destructive media suppression. HTMLMediaElements in the
+     * document (and accessible same-origin frames) are paused before opening
+     * ExoPlayer. Cross-origin frames are inaccessible by WebView's JS sandbox;
+     * WebView lifecycle/timers provide another layer of suspension.
+     *
+     * Do not navigate to about:blank: returning from the player must preserve
+     * the page, cookies, and the stream sniffer's candidates.
+     */
+    private fun pausePageMediaForPlayer() {
+        if (!::webView.isInitialized || webViewGone) return
+        webView.evaluateJavascript(PAUSE_PAGE_MEDIA_SCRIPT, null)
+    }
+
     override fun onPause() {
         super.onPause()
-        if (::webView.isInitialized && !webViewGone) webView.onPause()
+        if (::webView.isInitialized && !webViewGone) {
+            webView.onPause()
+            // onPause() alone need not suspend page JS timers. This is
+            // process-wide across WebViews, so always undo it in onResume().
+            webView.pauseTimers()
+        }
         if (::downloads.isInitialized) downloads.stop()
     }
 
     override fun onResume() {
         super.onResume()
-        if (::webView.isInitialized && !webViewGone) webView.onResume()
+        if (::webView.isInitialized && !webViewGone) {
+            webView.resumeTimers()
+            webView.onResume()
+        }
         if (::sniffer.isInitialized && sniffer.hasStream() && !overlayVisible()) showChip()
         if (::downloads.isInitialized) downloads.kick()
     }
@@ -1502,6 +1524,28 @@ class MainActivity : Activity() {
     }
 
     companion object {
+        // This executes in the page's own JS context, respecting same-origin
+        // restrictions. Pausing audio/video does not remove player elements.
+        private val PAUSE_PAGE_MEDIA_SCRIPT = """
+            (function() {
+              function pauseMedia(doc) {
+                try {
+                  var media = doc.querySelectorAll('video, audio');
+                  for (var i = 0; i < media.length; i++) {
+                    try { media[i].pause(); } catch (ignored) {}
+                  }
+                  var frames = doc.querySelectorAll('iframe');
+                  for (var j = 0; j < frames.length; j++) {
+                    try {
+                      var child = frames[j].contentDocument;
+                      if (child) pauseMedia(child);
+                    } catch (ignored) {}
+                  }
+                } catch (ignored) {}
+              }
+              pauseMedia(document);
+            })();
+        """.trimIndent()
         private const val CHIP_TIMEOUT_MS = 30_000L
         private const val CHIP_DONE_MS = 5_000L
         private const val LINE_FADE_MS = 200L
