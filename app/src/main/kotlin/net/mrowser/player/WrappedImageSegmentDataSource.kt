@@ -23,7 +23,7 @@ import java.io.InputStream
  * final MPEG-TS ByteArray that ExoPlayer needs.
  */
 /** Immutable loader-thread timing snapshot; no URLs, cookies, or request headers. */
-internal data class WrappedSegmentTiming(
+data class WrappedSegmentTiming(
     val networkReadMs: Long,
     val pngReadDecodeMs: Long,
     val extractMs: Long
