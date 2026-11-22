@@ -5,6 +5,8 @@ import android.app.AlertDialog
 import android.content.res.ColorStateList
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.text.SpannableStringBuilder
 import android.text.Spanned
@@ -44,6 +46,8 @@ import net.mrowser.data.SettingsRepository
 import net.mrowser.stream.MediaMimeType
 import net.mrowser.stream.PlaybackRequest
 import java.io.File
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicReference
 
 @OptIn(UnstableApi::class)
 class PlayerActivity : Activity() {
@@ -54,6 +58,27 @@ class PlayerActivity : Activity() {
     private var streamUrl: String? = null
     private var hasPlayedAudioOrVideo = false
     private var bufferingStartedMs = -1L
+
+    // Primitive counters are updated on ExoPlayer's application looper. Only
+    // KWP1 timing originates on a loader thread, hence the atomic snapshot.
+    private var droppedVideoFrames = 0L
+    private var rebufferCount = 0
+    private var rebufferTotalMs = 0L
+    private var lastMediaLoadMs = -1L
+    private var lastMediaBytes = 0L
+    private val lastWrappedTiming = AtomicReference<WrappedSegmentTiming?>()
+
+    // Zero periodic callbacks while hidden. The overlay cannot take D-pad focus.
+    private lateinit var statsView: TextView
+    private var statsVisible = false
+    private val statsHandler = Handler(Looper.getMainLooper())
+    private val statsRefresh = object : Runnable {
+        override fun run() {
+            if (!statsVisible || isFinishing || isDestroyed) return
+            player?.let { statsView.text = playbackStatsText(it) }
+            statsHandler.postDelayed(this, STATS_REFRESH_MS)
+        }
+    }
 
     // Read-only here; the browser writes it. Read when a stream's tracks arrive, so a toggle
     // flipped in Settings applies to the next stream with no restart.
@@ -70,6 +95,7 @@ class PlayerActivity : Activity() {
         setContentView(R.layout.player_activity)
         val playerView = findViewById<PlayerView>(R.id.playerView)
         this.playerView = playerView
+        statsView = findViewById(R.id.playbackStatsView)
 
         val json = intent.getStringExtra(EXTRA_REQUEST) ?: run { finish(); return }
         val request = PlaybackRequest.fromJson(json)
@@ -105,7 +131,9 @@ class PlayerActivity : Activity() {
         val exo = ExoPlayer.Builder(this)
             .setTrackSelector(trackSelector)
             .setMediaSourceFactory(DefaultMediaSourceFactory(DataSource.Factory {
-                WrappedImageSegmentDataSource(sourceFactory.createDataSource())
+                WrappedImageSegmentDataSource(sourceFactory.createDataSource()) { timing ->
+                    lastWrappedTiming.set(timing)
+                }
             }))
             .build()
         player = exo
@@ -120,6 +148,7 @@ class PlayerActivity : Activity() {
                 droppedFrames: Int,
                 elapsedMs: Long
             ) {
+                droppedVideoFrames += droppedFrames.toLong()
                 Log.w(DIAG_TAG, "DROPPED_VIDEO_FRAMES count=" + droppedFrames +
                     " windowMs=" + elapsedMs +
                     " bufferedMs=" + exo.totalBufferedDuration)
@@ -131,6 +160,8 @@ class PlayerActivity : Activity() {
                 mediaLoadData: MediaLoadData
             ) {
                 if (mediaLoadData.dataType != C.DATA_TYPE_MEDIA) return
+                lastMediaLoadMs = loadEventInfo.loadDurationMs
+                lastMediaBytes = loadEventInfo.bytesLoaded
                 Log.i(DIAG_TAG, "MEDIA_LOAD durationMs=" + loadEventInfo.loadDurationMs +
                     " bytes=" + loadEventInfo.bytesLoaded +
                     " bufferedMs=" + exo.totalBufferedDuration)
@@ -199,8 +230,13 @@ class PlayerActivity : Activity() {
                     }
                     Player.STATE_READY -> {
                         if (bufferingStartedMs >= 0L) {
+                            val elapsed = SystemClock.elapsedRealtime() - bufferingStartedMs
+                            if (hasPlayedAudioOrVideo) {
+                                rebufferCount++
+                                rebufferTotalMs += elapsed
+                            }
                             Log.w(DIAG_TAG, "READY afterBufferMs=" +
-                                (SystemClock.elapsedRealtime() - bufferingStartedMs) +
+                                elapsed +
                                 " bufferedMs=" + exo.totalBufferedDuration +
                                 " positionMs=" + exo.currentPosition)
                         }
@@ -292,7 +328,8 @@ class PlayerActivity : Activity() {
         val items = arrayOf(
             getString(R.string.track_video),
             getString(R.string.track_audio),
-            getString(R.string.speed)
+            getString(R.string.speed),
+            getString(if (statsVisible) R.string.playback_stats_hide else R.string.playback_stats_show)
         )
         AlertDialog.Builder(this)
             .setTitle(R.string.settings)
@@ -301,10 +338,65 @@ class PlayerActivity : Activity() {
                     0 -> TrackSelectionDialogBuilder(this, items[0], p, C.TRACK_TYPE_VIDEO).build().show()
                     1 -> TrackSelectionDialogBuilder(this, items[1], p, C.TRACK_TYPE_AUDIO).build().show()
                     2 -> showSpeed(p)
+                    3 -> togglePlaybackStats()
                 }
             }
             .show()
     }
+
+    private fun togglePlaybackStats() {
+        statsVisible = !statsVisible
+        statsView.visibility = if (statsVisible) View.VISIBLE else View.GONE
+        statsHandler.removeCallbacks(statsRefresh)
+        if (statsVisible) statsRefresh.run()
+    }
+
+    /** Only called when the user has opened the lightweight overlay. */
+    private fun playbackStatsText(p: ExoPlayer): String {
+        val format = p.videoFormat
+        val width = format?.width ?: -1
+        val height = format?.height ?: -1
+        val resolution = if (width > 0 && height > 0) "${width}x${height}" else "Unknown"
+        val fps = format?.frameRate ?: -1f
+        val video = if (fps > 0f) {
+            "$resolution @ ${String.format(Locale.US, "%.1f", fps)} fps"
+        } else resolution
+        val playbackState = when (p.playbackState) {
+            Player.STATE_IDLE -> "Idle"
+            Player.STATE_BUFFERING -> "Buffering"
+            Player.STATE_READY -> if (p.isPlaying) "Playing" else "Ready / paused"
+            Player.STATE_ENDED -> "Ended"
+            else -> "Unknown"
+        }
+        val liveOffset = if (p.isCurrentMediaItemLive && p.currentLiveOffset != C.TIME_UNSET) {
+            formatMs(p.currentLiveOffset)
+        } else "N/A"
+        val load = if (lastMediaLoadMs >= 0L) {
+            "${lastMediaLoadMs} ms (${String.format(Locale.US, "%.1f", lastMediaBytes / 1_048_576.0)} MiB TS)"
+        } else "N/A"
+        val wrapped = lastWrappedTiming.get()
+        return buildString(330) {
+            append("PLAYBACK STATISTICS\n")
+            append("State: ").append(playbackState).append('\n')
+            append("Video: ").append(video).append('\n')
+            append("Codec: ").append(format?.sampleMimeType ?: "Unknown").append('\n')
+            append("Buffered ahead: ").append(formatMs(p.totalBufferedDuration)).append('\n')
+            append("Live offset: ").append(liveOffset).append('\n')
+            append("Rebuffers: ").append(rebufferCount)
+                .append(" (").append(formatMs(rebufferTotalMs)).append(" total)\n")
+            append("Dropped frames: ").append(droppedVideoFrames).append('\n')
+            append("Last media load: ").append(load)
+            if (wrapped != null) {
+                append("\nLast wrapped PNG:")
+                append("\n   CDN read: ").append(wrapped.networkReadMs).append(" ms")
+                append("\n   PNG read/decode: ").append(wrapped.pngReadDecodeMs).append(" ms")
+                append("\n   RGB extract: ").append(wrapped.extractMs).append(" ms")
+            }
+        }
+    }
+
+    private fun formatMs(ms: Long): String =
+        String.format(Locale.US, "%.1f s", ms.coerceAtLeast(0L) / 1000.0)
 
     private fun showSubtitlePicker() {
         val c = subtitleController ?: return
@@ -364,6 +456,10 @@ class PlayerActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        if (statsVisible) {
+            statsHandler.removeCallbacks(statsRefresh)
+            statsRefresh.run()
+        }
         subtitleController?.resume()
         if (requestedModeId != 0) setPreferredDisplayMode(requestedModeId)
     }
@@ -382,6 +478,7 @@ class PlayerActivity : Activity() {
     }
 
     override fun onStop() {
+        statsHandler.removeCallbacks(statsRefresh)
         savePosition()
         super.onStop()
         setPreferredDisplayMode(originalModeId)
@@ -399,6 +496,7 @@ class PlayerActivity : Activity() {
     }
 
     override fun onDestroy() {
+        statsHandler.removeCallbacks(statsRefresh)
         super.onDestroy()
         setPreferredDisplayMode(originalModeId)
         subtitleController?.stop()
@@ -411,6 +509,7 @@ class PlayerActivity : Activity() {
     companion object {
         const val EXTRA_REQUEST = "mrowser.request"
         private const val STEP_MS = 500L
+        private const val STATS_REFRESH_MS = 2_000L
         private const val TAG = "PlayerActivity"
         private const val DIAG_TAG = "MrowserPlayback"
 

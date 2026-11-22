@@ -22,8 +22,18 @@ import java.io.InputStream
  * decoder reads a bounded stream; the only large outputs are its Bitmap and the
  * final MPEG-TS ByteArray that ExoPlayer needs.
  */
+/** Immutable loader-thread timing snapshot; no URLs, cookies, or request headers. */
+internal data class WrappedSegmentTiming(
+    val networkReadMs: Long,
+    val pngReadDecodeMs: Long,
+    val extractMs: Long
+)
+
 @OptIn(UnstableApi::class)
-class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSource {
+class WrappedImageSegmentDataSource(
+    private val upstream: DataSource,
+    private val onSegmentDecoded: (WrappedSegmentTiming) -> Unit = {}
+) : DataSource {
     private var mediaBytes: ByteArray? = null
     private var mediaPosition = 0
     private var prefix = ByteArray(0)
@@ -70,6 +80,11 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
             }
             val extractedMs = SystemClock.elapsedRealtime()
             mediaBytes = ts
+            onSegmentDecoded(WrappedSegmentTiming(
+                networkReadMs = input.networkReadMs,
+                pngReadDecodeMs = bitmapDoneMs - startedMs,
+                extractMs = extractedMs - bitmapDoneMs
+            ))
             Log.i(TAG, "Decoded KWP1 PNG: MPEG-TS=" + ts.size +
                 " bytes, packets=" + (ts.size / 188) +
                 " networkReadMs=" + input.networkReadMs +
