@@ -3,6 +3,7 @@ package net.mrowser.player
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.C
@@ -43,6 +44,7 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
         ) return originalLength
 
         try {
+            val startedMs = SystemClock.elapsedRealtime()
             val signature = readPrefix(8)
             if (!signature.contentEquals(PNG_SIGNATURE)) {
                 prefix = signature
@@ -60,14 +62,20 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
                 }
             ) ?: throw IOException("CDN PNG bitmap decoder returned null")
 
+            val bitmapDoneMs = SystemClock.elapsedRealtime()
             val ts = try {
                 unpackBitmap(bitmap)
             } finally {
                 bitmap.recycle()
             }
+            val extractedMs = SystemClock.elapsedRealtime()
             mediaBytes = ts
             Log.i(TAG, "Decoded KWP1 PNG: MPEG-TS=" + ts.size +
-                " bytes, packets=" + (ts.size / 188))
+                " bytes, packets=" + (ts.size / 188) +
+                " networkReadMs=" + input.networkReadMs +
+                " pngReadDecodeMs=" + (bitmapDoneMs - startedMs) +
+                " extractMs=" + (extractedMs - bitmapDoneMs) +
+                " totalMs=" + (extractedMs - startedMs))
             return ts.size.toLong()
         } catch (e: Exception) {
             Log.e(TAG, "KWP1 segment decoding failed", e)
@@ -183,6 +191,8 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
     ) : InputStream() {
         private var position = 0
         private var received = initial.size.toLong()
+        private var accumulatedNetworkNs = 0L
+        val networkReadMs: Long get() = accumulatedNetworkNs / 1_000_000L
 
         override fun read(): Int {
             val single = ByteArray(1)
@@ -203,7 +213,12 @@ class WrappedImageSegmentDataSource(private val upstream: DataSource) : DataSour
             if (received >= limit) {
                 throw IOException("PNG compressed input exceeds size limit")
             }
-            val n = upstream.read(b, off, minOf(len.toLong(), limit - received).toInt())
+            val readStartedNs = SystemClock.elapsedRealtimeNanos()
+            val n = try {
+                upstream.read(b, off, minOf(len.toLong(), limit - received).toInt())
+            } finally {
+                accumulatedNetworkNs += SystemClock.elapsedRealtimeNanos() - readStartedNs
+            }
             if (n == C.RESULT_END_OF_INPUT) return -1
             if (n <= 0) throw IOException("Zero-byte read from PNG source")
             received += n

@@ -5,6 +5,7 @@ import android.app.AlertDialog
 import android.content.res.ColorStateList
 import android.net.Uri
 import android.os.Bundle
+import android.os.SystemClock
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
@@ -29,6 +30,9 @@ import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.source.LoadEventInfo
+import androidx.media3.exoplayer.source.MediaLoadData
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
@@ -48,6 +52,8 @@ class PlayerActivity : Activity() {
     private var subtitleController: SubtitleSyncController? = null
     private var playerView: PlayerView? = null
     private var streamUrl: String? = null
+    private var hasPlayedAudioOrVideo = false
+    private var bufferingStartedMs = -1L
 
     // Read-only here; the browser writes it. Read when a stream's tracks arrive, so a toggle
     // flipped in Settings applies to the next stream with no restart.
@@ -105,6 +111,40 @@ class PlayerActivity : Activity() {
         player = exo
         playerView.player = exo
 
+        // Diagnostics for intermittent stalls on low-power Android TV devices.
+        // Never log source URLs, auth cookies, or stream-specific request headers.
+        // Media3 invokes these callbacks on the player's application looper.
+        exo.addAnalyticsListener(object : AnalyticsListener {
+            override fun onDroppedVideoFrames(
+                eventTime: AnalyticsListener.EventTime,
+                droppedFrames: Int,
+                elapsedMs: Long
+            ) {
+                Log.w(DIAG_TAG, "DROPPED_VIDEO_FRAMES count=" + droppedFrames +
+                    " windowMs=" + elapsedMs +
+                    " bufferedMs=" + exo.totalBufferedDuration)
+            }
+
+            override fun onLoadCompleted(
+                eventTime: AnalyticsListener.EventTime,
+                loadEventInfo: LoadEventInfo,
+                mediaLoadData: MediaLoadData
+            ) {
+                if (mediaLoadData.dataType != C.DATA_TYPE_MEDIA) return
+                Log.i(DIAG_TAG, "MEDIA_LOAD durationMs=" + loadEventInfo.loadDurationMs +
+                    " bytes=" + loadEventInfo.bytesLoaded +
+                    " bufferedMs=" + exo.totalBufferedDuration)
+            }
+
+            override fun onVideoCodecError(
+                eventTime: AnalyticsListener.EventTime,
+                videoCodecError: Exception
+            ) {
+                Log.w(DIAG_TAG, "VIDEO_CODEC_ERROR type=" +
+                    videoCodecError.javaClass.simpleName)
+            }
+        })
+
         // Replace the built-in control-bar gear's menu with ours, so video Quality sits
         // alongside Audio and Speed in the same gear. Re-applied whenever the controls
         // re-appear (the player can reset its own listeners).
@@ -150,7 +190,28 @@ class PlayerActivity : Activity() {
 
             // Played to the end: the next open starts over.
             override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_ENDED) resumePositions.clear(request.url)
+                when (playbackState) {
+                    Player.STATE_BUFFERING -> {
+                        bufferingStartedMs = SystemClock.elapsedRealtime()
+                        Log.w(DIAG_TAG, "BUFFERING afterPlayback=" + hasPlayedAudioOrVideo +
+                            " bufferedMs=" + exo.totalBufferedDuration +
+                            " positionMs=" + exo.currentPosition)
+                    }
+                    Player.STATE_READY -> {
+                        if (bufferingStartedMs >= 0L) {
+                            Log.w(DIAG_TAG, "READY afterBufferMs=" +
+                                (SystemClock.elapsedRealtime() - bufferingStartedMs) +
+                                " bufferedMs=" + exo.totalBufferedDuration +
+                                " positionMs=" + exo.currentPosition)
+                        }
+                        bufferingStartedMs = -1L
+                    }
+                    Player.STATE_ENDED -> {
+                        bufferingStartedMs = -1L
+                        resumePositions.clear(request.url)
+                    }
+                    else -> Unit
+                }
             }
 
             // TV ignores D-pad/touch during playback, so without this the system
@@ -158,6 +219,7 @@ class PlayerActivity : Activity() {
             // playing — a paused stream should still let the screen sleep.
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (isPlaying) {
+                    hasPlayedAudioOrVideo = true
                     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 } else {
                     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -350,6 +412,7 @@ class PlayerActivity : Activity() {
         const val EXTRA_REQUEST = "mrowser.request"
         private const val STEP_MS = 500L
         private const val TAG = "PlayerActivity"
+        private const val DIAG_TAG = "MrowserPlayback"
 
         // Process-wide, so it outlives each PlayerActivity: BACK finishes the player, and the
         // next Play synced starts a new one.
